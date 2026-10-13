@@ -1,0 +1,92 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned upstream for the real-headless job; bump deliberately.
+  VIVIDO_REV: 8bfb39b6674666e7ccdef2c67c598d7fdba940ce
+
+jobs:
+  check:
+    name: check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: format
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: build
+        run: cargo build --locked
+
+      - name: unit tests
+        run: cargo test --lib --locked
+
+      - name: integration tests (unix)
+        if: runner.os != 'Windows'
+        run: cargo test --locked
+
+      - name: release build
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo build --release --locked
+
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  headless:
+    name: real headless session
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: vivido-mcp
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: vivido-mcp
+
+      - name: Vivido build dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y build-essential cmake git pkg-config ncurses-bin \
+            libasound2-dev libfontconfig1-dev libfreetype6-dev \
+            libwayland-dev libxkbcommon-dev \
+            libavcodec-dev libavdevice-dev libavutil-dev libswscale-dev libswresample-dev \
+            libvulkan1 mesa-vulkan-drivers
+
+      - name: clone Vivido (pinned)
+        run: git clone https://github.com/vivido-dev/vivido vivido-upstream
+
+      - name: build Vivido
+        working-directory: vivido-upstream
+        run: |
+          git checkout "$VIVIDO_REV"
+          cargo build --release --bin vivido --locked
+
+      - name: headless integration tests
+        working-directory: vivido-mcp
+        env:
+          VIVIDO_BIN: ${{ github.workspace }}/vivido-upstream/target/release/vivido
+        run: cargo test --locked --test headless_real -- --ignored --test-threads=1
