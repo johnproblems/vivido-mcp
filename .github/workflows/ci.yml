@@ -9,7 +9,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # Pinned upstream for the real-headless job; bump deliberately.
-  VIVIDO_REV: 8bfb39b6674666e7ccdef2c67c598d7fdba940ce
+  VIVIDO_VERSION: 0.5.4
 
 jobs:
   check:
@@ -76,17 +76,12 @@ jobs:
             libavcodec-dev libavdevice-dev libavutil-dev libswscale-dev libswresample-dev \
             libvulkan1 mesa-vulkan-drivers
 
-      - name: clone Vivido (pinned)
-        run: git clone https://github.com/vivido-dev/vivido vivido-upstream
-
-      - name: build Vivido
-        working-directory: vivido-upstream
-        run: |
-          git checkout "$VIVIDO_REV"
-          cargo build --release --bin vivido --locked
+      - name: install Vivido (pinned)
+        run: cargo install vivido --version "$VIVIDO_VERSION" --locked
 
       - name: headless integration tests
         working-directory: vivido-mcp
-        env:
-          VIVIDO_BIN: ${{ github.workspace }}/vivido-upstream/target/release/vivido
-        run: cargo test --locked --test headless_real -- --ignored --test-threads=1
+        run: |
+          export VIVIDO_BIN="$HOME/.cargo/bin/vivido"
+          ls -la "$VIVIDO_BIN"
+          cargo test --locked --test headless_real -- --ignored --test-threads=1

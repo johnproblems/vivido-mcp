@@ -24,6 +24,12 @@ This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.html)
 - Demo footage: GIF + MP4 clips and captured frames in `assets/`, recorded against real
   headless Vivido; `demo/` holds the driver, VHS tapes, and reproduction script.
 
+### Fixed
+
+- CI: unix-only test module no longer breaks the Windows clippy gate.
+- CI: real-headless job installs pinned `vivido` from crates.io instead of building
+  git HEAD, whose sibling path dependencies lag behind.
+
 ### Changed
 
 - Unknown tools and arguments suggest the closest match ("did you mean …?").

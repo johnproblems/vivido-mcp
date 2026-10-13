@@ -433,7 +433,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod listing_tests {
     use super::*;
 
