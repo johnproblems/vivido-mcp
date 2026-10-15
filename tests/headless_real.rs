@@ -58,12 +58,19 @@ fn headless_session_runs_ls_and_reads_the_result() {
     assert!(!windows.is_error, "{}", windows.structured);
     let window_id = windows.structured["windows"][0]["window_id"].as_u64().unwrap();
 
+    // Anchor the output offset BEFORE acting: an unanchored wait only matches
+    // future bytes, so a fast shell could emit the echo before the wait
+    // registers and the test would burn 30s and flake.
+    let inspect = server.call("inspect", json!({"window_id": window_id}));
+    assert!(!inspect.is_error, "{}", inspect.structured);
+    let base = inspect.structured["window"]["sequences"]["output"].as_u64().unwrap();
+
     let typed = server.call("typing", json!({"window_id": window_id, "text": "echo hello-mcp\n"}));
     // Note: typing never appends Enter; the newline above is literal input.
     assert!(!typed.is_error, "{}", typed.structured);
     let waited = server.call(
         "wait_output",
-        json!({"window_id": window_id, "pattern": "hello-mcp", "timeout": "30s"}),
+        json!({"window_id": window_id, "pattern": "hello-mcp", "after_offset": base, "timeout": "30s"}),
     );
     assert!(!waited.is_error, "{}", waited.structured);
 
