@@ -54,6 +54,19 @@ impl Allowance {
             Tier::Process => self.process,
         }
     }
+
+    /// Enabled tiers as `--allow` spellings, most permissive last.
+    /// Single source for the startup log and prompt context strings.
+    pub fn tiers_enabled(self) -> Vec<&'static str> {
+        let mut tiers = vec![Tier::Observe.allow_name()];
+        if self.input || self.process {
+            tiers.push(Tier::Input.allow_name());
+        }
+        if self.process {
+            tiers.push(Tier::Process.allow_name());
+        }
+        tiers
+    }
 }
 
 /// Parse `--allow` values. Accepts repeats and comma-separated lists, case-insensitively.
@@ -64,16 +77,22 @@ pub fn parse_allow(values: &[String]) -> Result<Allowance, String> {
         for part in value.split(',') {
             match part.trim().to_ascii_lowercase().as_str() {
                 "" => {}
-                "observe" => {}
+                "observe" | "read-only" | "readonly" => {}
                 "input" => allowance.input = true,
                 "process" | "all" => {
                     allowance.input = true;
                     allowance.process = true;
                 }
                 other => {
-                    return Err(format!(
+                    let mut message = format!(
                         "unknown tier {other:?}: --allow accepts observe, input, process, all"
-                    ));
+                    );
+                    if let Some(guess) =
+                        crate::tools::suggest(other, &["observe", "input", "process", "all"])
+                    {
+                        message.push_str(&format!(", did you mean `{guess}`?"));
+                    }
+                    return Err(message);
                 }
             }
         }
@@ -111,7 +130,8 @@ pub fn refusal(tool: &str, tier: Tier, allowance: Allowance) -> String {
     };
     let mut message = format!(
         "tool `{tool}` needs tier `{}` but vivido-mcp was started {started}; \
-         restart it with `--allow {}`",
+         restart it with `--allow {}` (or set VIVIDO_MCP_ALLOW={})",
+        tier.allow_name(),
         tier.allow_name(),
         tier.allow_name()
     );
@@ -221,9 +241,38 @@ mod tests {
             assert!(message.contains("--allow"), "{message}");
             assert!(message.contains(tier.allow_name()), "{message}");
             assert!(message.contains("observe-only"), "{message}");
+            assert!(message.contains("VIVIDO_MCP_ALLOW"), "{message}");
         }
         let message = refusal("quit", Tier::Process, parse_allow(&["input".to_owned()]).unwrap());
         assert!(message.contains("--allow input"), "{message}");
         assert!(message.contains("--allow process"), "{message}");
+    }
+
+    #[test]
+    fn read_only_is_an_explicit_default() {
+        for spelling in ["read-only", "READ-ONLY", "readonly"] {
+            let parsed = parse_allow(&[spelling.to_owned()]).unwrap();
+            assert!(parsed.allows(Tier::Observe));
+            assert!(!parsed.allows(Tier::Input));
+            assert!(!parsed.allows(Tier::Process));
+        }
+    }
+
+    #[test]
+    fn unknown_tiers_suggest_the_closest_match() {
+        let error = parse_allow(&["inputs".to_owned()]).unwrap_err();
+        assert!(error.contains("did you mean `input`"), "{error}");
+        let error = parse_allow(&["everything".to_owned()]).unwrap_err();
+        assert!(error.contains("unknown tier"), "{error}");
+        assert!(!error.contains("did you mean"), "{error}");
+    }
+
+    #[test]
+    fn tiers_enabled_lists_cumulative_spellings() {
+        assert_eq!(Allowance::default().tiers_enabled(), vec!["observe"]);
+        let input = parse_allow(&["input".to_owned()]).unwrap();
+        assert_eq!(input.tiers_enabled(), vec!["observe", "input"]);
+        let process = parse_allow(&["process".to_owned()]).unwrap();
+        assert_eq!(process.tiers_enabled(), vec!["observe", "input", "process"]);
     }
 }

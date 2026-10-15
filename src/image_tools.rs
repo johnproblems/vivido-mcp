@@ -55,6 +55,22 @@ pub fn process_screenshot(
         .get("path")
         .and_then(Value::as_str)
         .ok_or_else(|| "screenshot reply is missing its path".to_owned())?;
+    match process_loaded(path, result, args, default_max_dim) {
+        Ok(image) => Ok(image),
+        Err(message) => {
+            // Failure paths must not leak the temp frame either.
+            let _ = fs::remove_file(path);
+            Err(message)
+        }
+    }
+}
+
+fn process_loaded(
+    path: &str,
+    result: &Value,
+    args: &Value,
+    default_max_dim: u32,
+) -> Result<ProcessedImage, String> {
     let bytes = fs::read(path).map_err(|error| format!("cannot read screenshot PNG: {error}"))?;
     let image = image::load_from_memory_with_format(&bytes, ImageFormat::Png)
         .map_err(|error| format!("cannot decode screenshot PNG: {error}"))?;
@@ -73,8 +89,14 @@ pub fn process_screenshot(
         Some("jpeg") | Some("jpg") => OutputFormat::Jpeg,
         Some(other) => return Err(format!("`format` must be \"png\" or \"jpeg\", not {other:?}")),
     };
-    let quality = args.get("quality").and_then(Value::as_u64).unwrap_or(85);
-    if format == OutputFormat::Jpeg && !(1..=100).contains(&quality) {
+    let quality = match args.get("quality").filter(|value| !value.is_null()) {
+        None => 85,
+        Some(Value::Number(number)) => {
+            number.as_u64().ok_or_else(|| "`quality` must be 1 through 100".to_owned())?
+        }
+        Some(_) => return Err("`quality` must be 1 through 100".to_owned()),
+    };
+    if !(1..=100).contains(&quality) {
         return Err("`quality` must be 1 through 100".to_owned());
     }
 
@@ -148,6 +170,7 @@ pub fn process_screenshot(
         "format": format.mime().split('/').nth(1).unwrap_or("png"),
         "mime": format.mime(),
         "bytes": base64_image.len(),
+        "encoded_bytes": encoded.len(),
         "temp_deleted": temp_deleted,
     });
     Ok(ProcessedImage { base64_image, mime: format.mime(), metadata })
@@ -166,6 +189,13 @@ fn crop_box(
     pad_x: u64,
     pad_y: u64,
 ) -> Result<CropBox, String> {
+    if let Some(object) = crop.as_object() {
+        for key in object.keys() {
+            if !["col", "row", "cols", "rows"].contains(&key.as_str()) {
+                return Err(format!("unknown `crop` key `{key}`; want col, row, cols, rows"));
+            }
+        }
+    }
     if cell_w == 0 || cell_h == 0 {
         return Err("capture is missing cell metrics; cannot crop".to_owned());
     }
@@ -226,5 +256,13 @@ mod tests {
         assert!(clamp_box(500, 0, 10, 10, 100, 100).is_err());
         assert_eq!(clamp_box(90, 90, 50, 50, 100, 100).unwrap(), ((90, 90, 10, 10), true));
         assert_eq!(clamp_box(10, 10, 20, 20, 100, 100).unwrap(), ((10, 10, 20, 20), false));
+    }
+
+    #[test]
+    fn crop_rejects_unknown_keys() {
+        let error =
+            crop_box(&json!({"col": 0, "row": 0, "cols": 1, "rows": 1, "zoom": 2}), 10, 10, 0, 0)
+                .unwrap_err();
+        assert!(error.contains("zoom"), "{error}");
     }
 }

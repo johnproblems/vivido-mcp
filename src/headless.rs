@@ -161,18 +161,20 @@ fn generate_session_name() -> String {
     format!("vivido-mcp-{}-{nanos:09}", std::process::id())
 }
 
-/// Validate a `--headless-size` value: `COLUMNSxLINES` or `WIDTHxHEIGHTpx`.
+/// Validate a `--headless-size` value: `COLUMNSxLINES` or `WIDTHxHEIGHTpx`,
+/// each dimension 1 through 16384.
 fn validate_size(size: &str) -> Result<(), String> {
     let pixels = size.strip_suffix("px").unwrap_or(size);
     let (first, second) = pixels
         .split_once('x')
         .ok_or_else(|| format!("invalid size {size:?}: expected 120x40 or 1280x720px"))?;
-    let valid = first.parse::<u32>().is_ok_and(|value| value > 0)
-        && second.parse::<u32>().is_ok_and(|value| value > 0);
-    if valid {
+    let in_range = |text: &str| text.parse::<u32>().is_ok_and(|value| (1..=16384).contains(&value));
+    if in_range(first) && in_range(second) {
         Ok(())
     } else {
-        Err(format!("invalid size {size:?}: expected 120x40 or 1280x720px"))
+        Err(format!(
+            "invalid size {size:?}: expected 120x40 or 1280x720px with each dimension 1-16384"
+        ))
     }
 }
 
@@ -222,7 +224,18 @@ mod tests {
         for size in ["120x40", "1280x720px"] {
             assert!(validate_size(size).is_ok(), "{size}");
         }
-        for size in ["120", "x40", "120x", "0x40", "huge", "120x40pt", "80X24"] {
+        for size in [
+            "120",
+            "x40",
+            "120x",
+            "0x40",
+            "huge",
+            "120x40pt",
+            "80X24",
+            "99999x40",
+            "80x99999px",
+            "16385x720px",
+        ] {
             assert!(validate_size(size).is_err(), "{size}");
         }
     }

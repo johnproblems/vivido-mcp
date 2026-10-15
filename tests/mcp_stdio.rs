@@ -151,6 +151,61 @@ fn id_less_calls_take_no_reply() {
 }
 
 #[test]
+fn frames_without_jsonrpc_v2_are_rejected() {
+    let mock = MockServer::start();
+    let mcp = &mut Mcp::spawn(&mock, &[]);
+    mcp.request("initialize", json!({}));
+    let line = json!({"id": 99, "method": "ping", "params": {}});
+    writeln!(mcp.stdin, "{line}").expect("write");
+    mcp.stdin.flush().expect("flush");
+    let mut reply = String::new();
+    mcp.reader.read_line(&mut reply).expect("read");
+    let reply: Value = serde_json::from_str(&reply).expect("parse");
+    assert_eq!(reply["error"]["code"], -32600, "{reply}");
+    assert_eq!(reply["id"], 99);
+}
+
+#[test]
+fn non_object_arguments_are_a_protocol_error() {
+    let mock = MockServer::start();
+    let mcp = &mut Mcp::spawn(&mock, &[]);
+    mcp.request("initialize", json!({}));
+    let reply = mcp.request("tools/call", json!({"name": "ping", "arguments": [1, 2]}));
+    assert_eq!(reply["error"]["code"], -32602, "{reply}");
+    // Null arguments still mean "no arguments".
+    let reply = mcp.request("tools/call", json!({"name": "ping", "arguments": null}));
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+}
+
+#[test]
+fn unknown_mcp_methods_suggest_neighbours() {
+    let mock = MockServer::start();
+    let mcp = &mut Mcp::spawn(&mock, &[]);
+    mcp.request("initialize", json!({}));
+    let reply = mcp.request("tools/callist", json!({}));
+    assert_eq!(reply["error"]["code"], -32601, "{reply}");
+    let message = reply["error"]["message"].as_str().unwrap();
+    assert!(message.contains("tools/call"), "{message}");
+}
+
+#[test]
+fn malformed_frames_carry_a_preview() {
+    let mock = MockServer::start();
+    let mcp = &mut Mcp::spawn(&mock, &[]);
+    mcp.request("initialize", json!({}));
+    writeln!(mcp.stdin, "not json{{{{{{").expect("write");
+    mcp.stdin.flush().expect("flush");
+    let mut reply = String::new();
+    mcp.reader.read_line(&mut reply).expect("read");
+    let reply: Value = serde_json::from_str(&reply).expect("parse");
+    assert_eq!(reply["error"]["code"], -32700, "{reply}");
+    assert_eq!(reply["error"]["data"]["line_preview"], "not json{{{", "{reply}");
+    // The server survives the bad frame.
+    let reply = mcp.request("ping", json!({}));
+    assert!(reply.get("result").is_some(), "{reply}");
+}
+
+#[test]
 fn unknown_tools_suggest_neighbours() {
     let mock = MockServer::start();
     let mcp = &mut Mcp::spawn(&mock, &[]);

@@ -19,7 +19,7 @@ use vivido_mcp::{mcp, tiers};
     name = "vivido-mcp",
     version,
     about,
-    long_about = "Stdio MCP server for Vivido terminal automation.\n\nScreens and state are readable by default; typing and process control are gated by tiers:\n\n  vivido-mcp                         observe only: screenshots, reads, waits\n  vivido-mcp --allow input            plus typing, keys, paste, mouse, file drops\n  vivido-mcp --allow process          everything, incl. windows and headless sessions\n  vivido-mcp --allow input --target build\n\nTiers are cumulative and may be comma-separated (--allow input,process),\nor given via VIVIDO_MCP_ALLOW. Point at one session with --socket PATH or\n--target NAME; otherwise the server resolves like `vivido msg`."
+    long_about = "Stdio MCP server for Vivido terminal automation.\n\nScreens and state are readable by default; typing and process control are gated by tiers:\n\n  vivido-mcp                         observe only: screenshots, reads, waits\n  vivido-mcp --allow input            plus typing, keys, paste, mouse, file drops\n  vivido-mcp --allow process          everything, incl. windows and headless sessions\n  vivido-mcp --allow input --target build\n\nTiers are cumulative and may be comma-separated (--allow input,process),\nor given via VIVIDO_MCP_ALLOW. Point at one session with --socket PATH or\n--target NAME; otherwise the server resolves like `vivido msg`.\n\nEnvironment: VIVIDO_MCP_ALLOW and VIVIDO_MCP_MAX_IMAGE_DIM mirror --allow and\n--max-image-dim; VIVIDO_BIN overrides --vivido-bin; VIVIDO_SESSION /\nVIVIDA_TARGET and VIVIDO_SOCKET feed endpoint discovery like `vivido msg`."
 )]
 struct Args {
     /// Safety tiers to enable: observe (default), input, process, all.
@@ -41,7 +41,12 @@ struct Args {
     vivido_bin: String,
 
     /// Default longest-edge cap for screenshots (64-4096).
-    #[arg(long = "max-image-dim", value_name = "PX", default_value_t = DEFAULT_MAX_DIM)]
+    #[arg(
+        long = "max-image-dim",
+        value_name = "PX",
+        default_value_t = DEFAULT_MAX_DIM,
+        env = "VIVIDO_MCP_MAX_IMAGE_DIM"
+    )]
     max_image_dim: u32,
 }
 
@@ -64,14 +69,18 @@ fn main() {
         eprintln!("vivido-mcp: --target: {message}");
         std::process::exit(1);
     }
+    if let Some(socket) = &args.socket
+        && socket.as_os_str().is_empty()
+    {
+        eprintln!("vivido-mcp: --socket must not be empty");
+        std::process::exit(1);
+    }
+    if args.vivido_bin.trim().is_empty() {
+        eprintln!("vivido-mcp: --vivido-bin must not be empty");
+        std::process::exit(1);
+    }
     let socket = args.socket.as_ref().map(|path| expand_tilde(path));
-    let tiers = if allowance.process {
-        "observe,input,process"
-    } else if allowance.input {
-        "observe,input"
-    } else {
-        "observe"
-    };
+    let tiers = allowance.tiers_enabled().join(",");
     eprintln!("vivido-mcp {} (tiers: {tiers})", env!("CARGO_PKG_VERSION"));
     let mut server = Server::new(ServerConfig {
         allowance,

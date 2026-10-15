@@ -123,13 +123,7 @@ impl Server {
 
     /// One-line session context for prompts: enabled tiers plus what is attached.
     pub fn context(&self) -> String {
-        let tiers = if self.config.allowance.process {
-            "observe,input,process"
-        } else if self.config.allowance.input {
-            "observe,input"
-        } else {
-            "observe"
-        };
+        let tiers = self.config.allowance.tiers_enabled().join(",");
         let attached = self
             .hello
             .as_ref()
@@ -147,7 +141,7 @@ impl Server {
                 )
             })
             .unwrap_or_else(|| "not connected".to_owned());
-        format!("enabled tiers: {tiers}; attached: {attached}")
+        format!("enabled tiers: {tiers}; attached: {attached}; {} tools", self.catalog.len())
     }
 
     /// Call one tool by name.
@@ -229,6 +223,12 @@ impl Server {
                 Ok(ToolOutput::ok_text(result))
             }
             ToolKind::Passthrough { method } => {
+                if !args.is_object() {
+                    return Err((
+                        "tool arguments must be a JSON object".to_owned(),
+                        "invalid_args".to_owned(),
+                    ));
+                }
                 let result = self.request(method, args.clone())?;
                 Ok(ToolOutput::ok_text(result))
             }
@@ -261,7 +261,7 @@ impl Server {
 
     fn call_screenshot(&mut self, args: &Value) -> Result<ToolOutput, ToolError> {
         check_args("screenshot", args)?;
-        let window_id = args.get("window_id").cloned().unwrap_or(Value::Null);
+        let window_id = checked_window_id(args)?;
         let result = self.request("screenshot", json!({ "window_id": window_id }))?;
         let image =
             crate::image_tools::process_screenshot(&result, args, self.config.default_max_dim)
@@ -271,7 +271,12 @@ impl Server {
 
     fn call_capture(&mut self, args: &Value) -> Result<ToolOutput, ToolError> {
         check_args("capture", args)?;
-        let window_id = args.get("window_id").cloned().unwrap_or(Value::Null);
+        let window_id = checked_window_id(args)?;
+        for flag in ["activate", "stable"] {
+            if args.get(flag).is_some_and(|value| !value.is_null() && !value.is_boolean()) {
+                return Err((format!("`{flag}` must be a boolean"), "invalid_args".to_owned()));
+            }
+        }
         let timeout = tools::parse_timeout(args, "timeout", 30_000)
             .map_err(|message| (message, "invalid_args".to_owned()))?;
         let mut activated = false;
@@ -407,21 +412,40 @@ impl Server {
 
     fn call_headless_start(&mut self, args: &Value) -> Result<ToolOutput, ToolError> {
         check_args("headless_start", args)?;
-        let options = crate::headless::StartOptions {
-            session: args.get("session").and_then(Value::as_str).map(str::to_owned),
-            size: args
-                .get("size")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .or_else(|| Some("1280x720px".to_owned())),
-            program: args.get("program").and_then(Value::as_str).map(str::to_owned),
-            args: args
-                .get("args")
-                .and_then(Value::as_array)
-                .map(|items| items.iter().filter_map(Value::as_str).map(str::to_owned).collect())
-                .unwrap_or_default(),
-            ephemeral: args.get("ephemeral").and_then(Value::as_bool).unwrap_or(true),
+        let session = strict_string(args, "session")?;
+        let size = strict_string(args, "size")?.or_else(|| Some("1280x720px".to_owned()));
+        let program = strict_string(args, "program")?;
+        let program_args = match args.get("args").filter(|value| !value.is_null()) {
+            None => Vec::new(),
+            Some(Value::Array(items)) => {
+                let mut collected = Vec::with_capacity(items.len());
+                for item in items {
+                    collected.push(
+                        item.as_str()
+                            .ok_or_else(|| {
+                                (
+                                    "`args` must be an array of strings".to_owned(),
+                                    "invalid_args".to_owned(),
+                                )
+                            })?
+                            .to_owned(),
+                    );
+                }
+                collected
+            }
+            Some(_) => {
+                return Err((
+                    "`args` must be an array of strings".to_owned(),
+                    "invalid_args".to_owned(),
+                ));
+            }
         };
+        if program.is_none() && !program_args.is_empty() {
+            return Err(("`args` needs a `program`".to_owned(), "invalid_args".to_owned()));
+        }
+        let ephemeral = strict_bool(args, "ephemeral", true)?;
+        let options =
+            crate::headless::StartOptions { session, size, program, args: program_args, ephemeral };
         let size = options.size.clone();
         let ephemeral = options.ephemeral;
         let started = crate::headless::start(&self.config.vivido_bin, options)
@@ -453,14 +477,19 @@ impl Server {
 
     fn call_headless_attach(&mut self, args: &Value) -> Result<ToolOutput, ToolError> {
         check_args("headless_attach", args)?;
-        let target = args
-            .get("target")
-            .and_then(Value::as_str)
-            .ok_or_else(|| ("missing required `target`".to_owned(), "invalid_args".to_owned()))?;
-        let endpoint = endpoint::resolve(None, Some(target))
+        let target = match args.get("target").filter(|value| !value.is_null()) {
+            None => {
+                return Err(("missing required `target`".to_owned(), "invalid_args".to_owned()));
+            }
+            Some(Value::String(target)) => target.clone(),
+            Some(_) => {
+                return Err(("`target` must be a string".to_owned(), "invalid_args".to_owned()));
+            }
+        };
+        let endpoint = endpoint::resolve(None, Some(target.as_str()))
             .map_err(|message| (message, "transport_error".to_owned()))?;
         self.redactor.add(&endpoint.path.to_string_lossy());
-        let already = already_attached(self.hello.as_ref(), target);
+        let already = already_attached(self.hello.as_ref(), &target);
         self.connect_to(endpoint.path, endpoint.label)
             .map_err(|message| (message, "transport_error".to_owned()))?;
         let hello = self.hello.clone().expect("connected");
@@ -495,19 +524,20 @@ impl Server {
 
     fn call_headless_stop(&mut self, args: &Value) -> Result<ToolOutput, ToolError> {
         check_args("headless_stop", args)?;
-        let target = args
-            .get("target")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                self.hello.as_ref().and_then(|hello| {
-                    hello.session.clone().or_else(|| hello.automation_name.clone())
-                })
-            })
-            .ok_or_else(|| {
-                ("no attached session; pass `target`".to_owned(), "invalid_args".to_owned())
-            })?;
-        let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+        let target = match args.get("target").filter(|value| !value.is_null()) {
+            None => self
+                .hello
+                .as_ref()
+                .and_then(|hello| hello.session.clone().or_else(|| hello.automation_name.clone()))
+                .ok_or_else(|| {
+                    ("no attached session; pass `target`".to_owned(), "invalid_args".to_owned())
+                })?,
+            Some(Value::String(target)) => target.clone(),
+            Some(_) => {
+                return Err(("`target` must be a string".to_owned(), "invalid_args".to_owned()));
+            }
+        };
+        let force = strict_bool(args, "force", false)?;
         let stopped_as = crate::headless::stop(&self.config.vivido_bin, &target, force, || {
             let endpoint =
                 endpoint::resolve(None, Some(&target)).map_err(|message| message.to_string())?;
@@ -627,6 +657,8 @@ fn check_args(tool: &str, args: &Value) -> Result<(), ToolError> {
             "timeout",
             "crop",
             "max_dim",
+            "format",
+            "quality",
         ],
         "drain_events" => &["cursor", "window_id", "all", "events", "limit", "timeout"],
         "subscribe" => &["window_id", "all", "events", "since_event", "limit", "timeout"],
@@ -661,7 +693,20 @@ fn drain_filter(args: &Value) -> Result<DrainFilter, ToolError> {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::String(kind)) => vec![kind.clone()],
         Some(Value::Array(items)) => {
-            items.iter().filter_map(Value::as_str).map(str::to_owned).collect()
+            let mut kinds = Vec::with_capacity(items.len());
+            for item in items {
+                kinds.push(
+                    item.as_str()
+                        .ok_or_else(|| {
+                            (
+                                "`events` must be a kind or an array of kinds".to_owned(),
+                                "invalid_args".to_owned(),
+                            )
+                        })?
+                        .to_owned(),
+                );
+            }
+            kinds
         }
         Some(_) => {
             return Err((
@@ -671,6 +716,36 @@ fn drain_filter(args: &Value) -> Result<DrainFilter, ToolError> {
         }
     };
     Ok(DrainFilter { window_id, all, events })
+}
+
+/// `window_id` for composite tools: absent/null passes through, anything else
+/// must be an integer before it reaches the wire.
+fn checked_window_id(args: &Value) -> Result<Value, ToolError> {
+    let Some(value) = args.get("window_id").filter(|value| !value.is_null()) else {
+        return Ok(Value::Null);
+    };
+    match value.as_u64() {
+        Some(id) => Ok(Value::from(id)),
+        None => Err(("`window_id` must be an integer".to_owned(), "invalid_args".to_owned())),
+    }
+}
+
+/// Optional string argument: absent/null is `None`, present must be a string.
+fn strict_string(args: &Value, name: &str) -> Result<Option<String>, ToolError> {
+    match args.get(name).filter(|value| !value.is_null()) {
+        None => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.clone())),
+        Some(_) => Err((format!("`{name}` must be a string"), "invalid_args".to_owned())),
+    }
+}
+
+/// Boolean argument with a default: absent/null is the default, present must be a bool.
+fn strict_bool(args: &Value, name: &str, default: bool) -> Result<bool, ToolError> {
+    match args.get(name).filter(|value| !value.is_null()) {
+        None => Ok(default),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => Err((format!("`{name}` must be a boolean"), "invalid_args".to_owned())),
+    }
 }
 
 /// Client-side result shaping: `transcript` with `raw` decodes to text.

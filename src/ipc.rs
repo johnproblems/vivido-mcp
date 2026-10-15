@@ -78,6 +78,8 @@ pub fn hint_for(code: &str) -> Option<&'static str> {
         "focus_denied" => Some("the window system refused activation"),
         "resize_mismatch" => Some("the requested size was not reached"),
         "subscription_overflow" => Some("poll drain_events more often or narrow events"),
+        "invalid_params" => Some("check arguments against the tool schema"),
+        "not_supported" => Some("this endpoint build lacks the method"),
         _ => None,
     }
 }
@@ -600,6 +602,8 @@ mod tests {
         });
         assert!(failure.message().contains("list_windows"), "{}", failure.message());
         assert!(hint_for("bogus").is_none());
+        assert!(hint_for("invalid_params").unwrap().contains("tool schema"));
+        assert!(hint_for("not_supported").unwrap().contains("lacks the method"));
     }
 
     #[test]

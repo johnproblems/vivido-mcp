@@ -29,6 +29,16 @@ MP4 versions sit next to the GIFs in [`assets/`](assets/).
 
 ![headless demo](assets/demo-headless.gif)
 
+**Forgiving spellings** — key aliases, `SIG`-prefixed signals, and uppercase durations
+driving a real ephemeral session, verified with a settled JPEG capture:
+
+![spellings demo](assets/demo-spellings.gif)
+
+**Strict validation** — tier refusals naming the env fix, prefix suggestions, fail-fast
+argument types, and JSON-RPC shape errors, all against a real ephemeral session:
+
+![strict demo](assets/demo-strict.gif)
+
 A captured frame from the act demo (960×540, real rendered output):
 
 ![captured terminal frame](assets/shot-act.png)
@@ -106,10 +116,13 @@ Three cumulative tiers, chosen at launch with `--allow` (repeatable, comma-separ
 | `input` | `--allow input` | Plus typing, keys, paste, mouse, file drops |
 | `process` | `--allow process` | Plus window create/close/resize/geometry, config, focus, signals, exec, terminal reset/restart, quit, headless start/attach/stop |
 
-A mutating tool called under the default tier is refused with a message naming `--allow`.
-Tool annotations mirror the tier, so client approval UIs prompt correctly.
-`VIVIDO_MCP_ALLOW` provides the same value as `--allow` for clients where flags are awkward;
-`VIVIDO_BIN` overrides the Vivido binary likewise.
+A mutating tool called under the default tier is refused with a message naming `--allow`
+(and its `VIVIDO_MCP_ALLOW` alternative). Tool annotations mirror the tier, so client
+approval UIs prompt correctly. `VIVIDO_MCP_ALLOW` provides the same value as `--allow`
+for clients where flags are awkward; `VIVIDO_BIN` overrides the Vivido binary likewise.
+`VIVIDO_MCP_MAX_IMAGE_DIM` mirrors `--max-image-dim`, and `VIVIDO_MCP_OVERSIZE_BYTES`
+tunes the stderr note emitted when a tool result exceeds 1 MiB. `--allow read-only`
+spells the default tier explicitly, and unknown tiers suggest the closest match.
 
 ## How it works
 
@@ -153,9 +166,18 @@ Highlights beyond the 1:1 wire methods:
 - `headless_start` / `headless_attach` / `headless_stop` manage ephemeral headless sessions;
   `headless_list` (observe tier) lists registered sessions with liveness.
 - `screenshot` / `capture` support `format: "jpeg"` plus `quality` for photographic media;
-  metadata reports `mime`, `bytes`, `max_dim`, and whether a crop was clamped.
+  metadata reports `mime`, `bytes`, `encoded_bytes`, `max_dim`, and whether a crop
+  was clamped. Failed captures delete their temp file too.
 - `type_text` aliases the `typing` wire method.
-- Timeouts accept milliseconds or `"500ms"` / `"30s"` / `"5m"` durations.
+- Timeouts accept milliseconds or `"500ms"` / `"30s"` / `"5m"` durations (suffixes
+  case-insensitive, surrounding whitespace ignored).
+- Forgiving spellings, strict types: `key` accepts everyday aliases (`Return`, `Esc`,
+  `Up`/`Down`/`Left`/`Right`, `Space`, …), `signal` accepts `SIGINT`, mouse buttons
+  and actions and Vivid categories/conditions match case-insensitively, `set_level`
+  takes dashes, `drop_file.at` takes `{col,row}`, and single strings coerce to
+  one-element lists. Mistyped arguments fail fast with `invalid_args` instead of
+  silently defaulting, and unknown tools, arguments, and MCP methods suggest the
+  closest match.
 
 Three prompts (`vivido_workflow`, `vivido_headless_test`, `vivido_debug`) teach no-shell
 clients the same discover → act → verify loop the Agent Skill teaches shell users, annotated

@@ -42,6 +42,12 @@ pub struct Endpoint {
 pub fn resolve(socket: Option<PathBuf>, target: Option<&str>) -> Result<Endpoint, String> {
     if let Some(path) = socket {
         check_owned_socket(&path)?;
+        if !probe(&path) {
+            return Err(format!(
+                "endpoint {} exists but is not accepting connections; is Vivido running there?",
+                path.display()
+            ));
+        }
         return Ok(Endpoint { path, label: "explicit --socket".to_owned() });
     }
 
@@ -65,6 +71,9 @@ pub fn resolve(socket: Option<PathBuf>, target: Option<&str>) -> Result<Endpoint
         if check_owned_socket(&candidate).is_ok() && probe(&candidate) {
             return Ok(Endpoint { path: candidate, label: "inherited VIVIDO_SOCKET".to_owned() });
         }
+        eprintln!(
+            "vivido-mcp: note: inherited {VIVIDO_SOCKET_ENV} is stale; falling through to session discovery"
+        );
     }
 
     let sessions = list_registries().unwrap_or_default();
@@ -148,6 +157,9 @@ fn list_sessions_in_root(root: &Path) -> Vec<SessionSummary> {
             continue;
         }
         if let Ok(registry) = read_registry_file(&path) {
+            if registry.socket.as_os_str().is_empty() {
+                continue;
+            }
             sessions.push(SessionSummary {
                 name: registry.name,
                 headless: registry.headless,
@@ -185,7 +197,9 @@ fn list_registries() -> Result<Vec<SessionRegistry>, String> {
         if !is_registry {
             continue;
         }
-        if let Ok(registry) = read_registry_file(&path) {
+        if let Ok(registry) = read_registry_file(&path)
+            && !registry.socket.as_os_str().is_empty()
+        {
             sessions.push(registry);
         }
     }
@@ -475,5 +489,36 @@ mod listing_tests {
         assert_eq!(sessions[1].name, "b-dead");
         assert!(!sessions[1].live);
         assert!(!sessions[1].headless);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_dead_socket_fails_fast_at_resolve() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dead.sock");
+        std::fs::write(&path, "not a socket").unwrap();
+        let error = resolve(Some(path), None).unwrap_err();
+        assert!(error.contains("not accepting connections"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registries_with_empty_sockets_are_skipped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let write_reg = |file: &str, value: Value| {
+            let path = dir.path().join(file);
+            std::fs::write(&path, value.to_string()).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        write_reg("session-empty.json", serde_json::json!({"name": "empty", "socket": ""}));
+        write_reg(
+            "session-good.json",
+            serde_json::json!({"name": "good", "socket": "/nonexistent/x.sock"}),
+        );
+        let sessions = list_sessions_in_root(dir.path());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].name, "good");
     }
 }

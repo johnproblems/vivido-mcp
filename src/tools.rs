@@ -408,8 +408,9 @@ fn check_timeout_range(name: &str, ms: u64) -> Result<u64, String> {
 }
 
 /// Parse a CLI-style duration (`500ms`, `30s`, `5m`, `1h`, bare milliseconds).
+/// Suffixes match case-insensitively and surrounding whitespace is ignored.
 pub fn parse_duration(text: &str) -> Result<u64, String> {
-    let text = text.trim();
+    let text = text.trim().to_ascii_lowercase();
     let (number, multiplier) = if let Some(number) = text.strip_suffix("ms") {
         (number, 1)
     } else if let Some(number) = text.strip_suffix('s') {
@@ -419,7 +420,7 @@ pub fn parse_duration(text: &str) -> Result<u64, String> {
     } else if let Some(number) = text.strip_suffix('h') {
         (number, 3_600_000)
     } else {
-        (text, 1)
+        (text.as_str(), 1)
     };
     let number = number.parse::<u64>().map_err(|_| format!("invalid duration {text:?}"))?;
     number.checked_mul(multiplier).ok_or_else(|| format!("duration {text:?} is too large"))
@@ -566,14 +567,27 @@ fn known_method(method: &str) -> &'static str {
     }
 }
 
-/// Suggest the closest candidate to a misspelled name (edit distance <= 3).
+/// Suggest the closest candidate to a misspelled name (edit distance <= 3,
+/// else the shortest prefix match in either direction).
 pub fn suggest(name: &str, candidates: &[&str]) -> Option<String> {
-    candidates
+    if let Some((_, candidate)) = candidates
         .iter()
         .map(|candidate| (edit_distance(name, candidate), candidate))
         .filter(|(distance, _)| *distance <= 3)
         .min()
-        .map(|(_, candidate)| candidate.to_string())
+    {
+        return Some(candidate.to_string());
+    }
+    // No fuzzy match: a bare prefix still orients (`wait` -> `wait_exit`,
+    // `pingpong` -> `ping`). Single characters match too much to help.
+    if name.len() < 2 {
+        return None;
+    }
+    candidates
+        .iter()
+        .filter(|candidate| candidate.starts_with(name) || name.starts_with(*candidate))
+        .min_by_key(|candidate| (candidate.len(), *candidate))
+        .map(|candidate| candidate.to_string())
 }
 
 fn edit_distance(left: &str, right: &str) -> usize {
@@ -791,8 +805,17 @@ pub fn translate(method: &str, args: &Value) -> Result<Value, String> {
             if items.is_empty() {
                 return Err("`items` must not be empty".to_owned());
             }
-            let translated =
-                items.iter().map(translate_set_geometry).collect::<Result<Vec<_>, _>>()?;
+            let translated = items
+                .iter()
+                .map(|item| {
+                    check_known_args(
+                        "set_geometry_batch item",
+                        item,
+                        &["window_id", "x", "y", "width", "height"],
+                    )?;
+                    translate_set_geometry(item)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(json!({ "items": translated }))
         }
         "set_visible" => Ok(json!({
@@ -802,7 +825,7 @@ pub fn translate(method: &str, args: &Value) -> Result<Value, String> {
             "target": { "window_id": arg_u64(args, "window_id")? },
         })),
         "set_level" => {
-            let level = required_string(args, "level")?;
+            let level = required_string(args, "level")?.replace('-', "_");
             let level = ["normal", "always_on_top", "always_on_bottom"]
                 .iter()
                 .find(|canonical| canonical.eq_ignore_ascii_case(&level))
@@ -816,9 +839,11 @@ pub fn translate(method: &str, args: &Value) -> Result<Value, String> {
             }))
         }
         "signal" => {
-            let signal = required_string(args, "signal")?.to_ascii_uppercase();
+            let upper = required_string(args, "signal")?.to_ascii_uppercase();
+            // Accept both `INT` and `SIGINT` spellings.
+            let signal = upper.strip_prefix("SIG").unwrap_or(&upper);
             if !["INT", "TERM", "HUP", "QUIT", "TSTP", "CONT", "WINCH", "KILL", "STOP"]
-                .contains(&signal.as_str())
+                .contains(&signal)
             {
                 return Err(format!("unknown signal {signal:?}"));
             }
@@ -831,6 +856,9 @@ pub fn translate(method: &str, args: &Value) -> Result<Value, String> {
             let command = required_string(args, "command")?;
             if command.trim().is_empty() {
                 return Err("`command` must not be empty".to_owned());
+            }
+            if command.contains('\0') {
+                return Err("`command` must not contain NUL bytes".to_owned());
             }
             if command.len() > 64 * 1024 {
                 return Err("`command` exceeds 64 KiB".to_owned());
@@ -849,8 +877,11 @@ pub fn translate(method: &str, args: &Value) -> Result<Value, String> {
         "config" => {
             let reset = arg_bool(args, "reset", false)?;
             let options = arg_string_list(args, "options")?;
-            if reset == !options.is_empty() {
-                return Err("`config` needs `options` or `reset: true`, not both".to_owned());
+            if reset && !options.is_empty() {
+                return Err("`config` takes `options` or `reset: true`, not both".to_owned());
+            }
+            if !reset && options.is_empty() {
+                return Err("`config` needs `options` or `reset: true`".to_owned());
             }
             Ok(json!({
                 "options": options,
@@ -1030,7 +1061,23 @@ fn canonical_key_name(key: &str) -> Result<String, String> {
     if let Some(canonical) = NAMED.iter().find(|name| name.eq_ignore_ascii_case(key)) {
         return Ok(canonical.to_string());
     }
+    const ALIASES: &[(&str, &str)] = &[
+        ("return", "Enter"),
+        ("esc", "Escape"),
+        ("del", "Delete"),
+        ("ins", "Insert"),
+        ("up", "ArrowUp"),
+        ("down", "ArrowDown"),
+        ("left", "ArrowLeft"),
+        ("right", "ArrowRight"),
+        ("space", " "),
+        ("pageup", "PageUp"),
+        ("pagedown", "PageDown"),
+    ];
     let lower = key.to_ascii_lowercase();
+    if let Some((_, canonical)) = ALIASES.iter().find(|(alias, _)| *alias == lower) {
+        return Ok(canonical.to_string());
+    }
     if let Some(number) = lower.strip_prefix('f')
         && let Ok(number) = number.parse::<u32>()
         && (1..=35).contains(&number)
@@ -1052,6 +1099,9 @@ fn translate_drop_file(args: &Value) -> Result<Value, String> {
     let absolute = std::path::absolute(&path).map_err(|error| error.to_string())?;
     let metadata = std::fs::symlink_metadata(&absolute)
         .map_err(|_| format!("`path` does not exist: {}", absolute.display()))?;
+    if metadata.file_type().is_dir() {
+        return Err(format!("`path` is a directory, not a regular file: {}", absolute.display()));
+    }
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err("`path` must be a regular file".to_owned());
     }
@@ -1064,9 +1114,10 @@ fn translate_drop_file(args: &Value) -> Result<Value, String> {
     if let Some(at) = arg(args, "at") {
         let (column, row) = match at {
             Value::Array(pair) if pair.len() == 2 => (pair[0].as_u64(), pair[1].as_u64()),
-            Value::Object(_) => {
-                (at.get("column").and_then(Value::as_u64), at.get("row").and_then(Value::as_u64))
-            }
+            Value::Object(_) => (
+                at.get("column").or_else(|| at.get("col")).and_then(Value::as_u64),
+                at.get("row").and_then(Value::as_u64),
+            ),
             Value::String(text) => match text.split_once(',') {
                 Some((column, row)) => {
                     (column.trim().parse::<u64>().ok(), row.trim().parse::<u64>().ok())
@@ -1090,15 +1141,17 @@ fn translate_drop_file(args: &Value) -> Result<Value, String> {
 }
 
 fn translate_mouse(args: &Value) -> Result<Value, String> {
-    // Accept the CLI's dashed spelling alongside snake_case.
-    let action = required_string(args, "action")?.replace('-', "_");
+    // Accept the CLI's dashed spelling alongside snake_case, any case.
+    let action = required_string(args, "action")?.replace('-', "_").to_ascii_lowercase();
     let mods = normalize_mods(args)?;
     let route = input_route(args)?;
     let window_id = arg_u64(args, "window_id")?;
     let button_arg = arg_string(args, "button")?;
     let button = match button_arg.as_deref() {
         None => "left",
-        Some(name @ ("left" | "middle" | "right")) => name,
+        Some(name) if name.eq_ignore_ascii_case("left") => "left",
+        Some(name) if name.eq_ignore_ascii_case("middle") => "middle",
+        Some(name) if name.eq_ignore_ascii_case("right") => "right",
         Some(other) => return Err(format!("unknown `button` {other:?}")),
     };
     let position = mouse_position(args, &mods, route, window_id)?;
@@ -1152,8 +1205,20 @@ fn translate_mouse(args: &Value) -> Result<Value, String> {
             }
             let duration = match arg(args, "duration") {
                 None => Value::Null,
-                Some(Value::Number(_)) | Some(Value::String(_)) => {
-                    let ms = parse_timeout(args, "duration", 0)?;
+                Some(Value::Number(number)) => {
+                    let ms = number
+                        .as_u64()
+                        .ok_or_else(|| "mouse `duration` must be 1ms through 30s".to_owned())?;
+                    if !(1..=30_000).contains(&ms) {
+                        return Err("mouse `duration` must be 1ms through 30s".to_owned());
+                    }
+                    json!(ms)
+                }
+                Some(Value::String(text)) => {
+                    let ms = parse_duration(text).map_err(|_| {
+                        "mouse `duration` must be milliseconds or a duration like \"500ms\""
+                            .to_owned()
+                    })?;
                     if !(1..=30_000).contains(&ms) {
                         return Err("mouse `duration` must be 1ms through 30s".to_owned());
                     }
@@ -1247,9 +1312,10 @@ fn translate_set_geometry(args: &Value) -> Result<Value, String> {
 
 fn translate_create_window(args: &Value) -> Result<Value, String> {
     let vivid_target = arg_string(args, "vivid_target")?.unwrap_or_else(|| "terminal".to_owned());
-    if vivid_target != "terminal" && vivid_target != "desktop" {
-        return Err("`vivid_target` must be \"terminal\" or \"desktop\"".to_owned());
-    }
+    let vivid_target = ["terminal", "desktop"]
+        .iter()
+        .find(|canonical| canonical.eq_ignore_ascii_case(&vivid_target))
+        .ok_or_else(|| "`vivid_target` must be \"terminal\" or \"desktop\"".to_owned())?;
     let mut command: Vec<String> = Vec::new();
     if let Some(program) = arg_string(args, "program")? {
         if arg(args, "command").is_some() {
@@ -1341,12 +1407,13 @@ fn translate_vivid_trace(args: &Value) -> Result<Value, String> {
         "recovery_only": arg_bool(args, "recovery_only", false)?,
     });
     if params["category"].is_string() {
-        let category = params["category"].as_str().unwrap();
+        let category = params["category"].as_str().unwrap().to_ascii_lowercase();
         if !["connection", "lifecycle", "flow", "playback", "recovery", "decode", "render"]
-            .contains(&category)
+            .contains(&category.as_str())
         {
             return Err(format!("unknown trace `category` {category:?}"));
         }
+        params["category"] = json!(category);
     }
     if let Some(sequence) = around {
         let preceding = arg_u16(args, "preceding", 0, 512)?.unwrap_or(64);
@@ -1361,7 +1428,7 @@ fn translate_vivid_trace(args: &Value) -> Result<Value, String> {
 }
 
 fn translate_vivid_wait(args: &Value) -> Result<Value, String> {
-    let condition = required_string(args, "condition")?.replace('_', "-");
+    let condition = required_string(args, "condition")?.replace('_', "-").to_ascii_lowercase();
     let wire = match condition.as_str() {
         "revision-after" => 1,
         "milestones" => 2,
@@ -1814,9 +1881,9 @@ fn drain_schema() -> Value {
                 "description": "Receive every window plus process lifecycle events (default false).",
             },
             "events": {
-                "type": "array",
+                "type": ["array", "string"],
                 "items": { "type": "string" },
-                "description": "Event kinds to keep (see hello `event_kinds`); omit for all kinds.",
+                "description": "Event kinds to keep (see hello `event_kinds`); a single kind coerces to one kind. Omit for all kinds.",
             },
             "limit": {
                 "type": "integer",
@@ -1842,9 +1909,9 @@ fn subscribe_schema() -> Value {
                 "description": "Receive every window plus process lifecycle events (default false).",
             },
             "events": {
-                "type": "array",
+                "type": ["array", "string"],
                 "items": { "type": "string" },
-                "description": "Event kinds to keep; omit for all kinds.",
+                "description": "Event kinds to keep; a single kind coerces to one kind. Omit for all kinds.",
             },
             "since_event": {
                 "type": "integer",
@@ -1922,7 +1989,7 @@ fn schema_for(method: &str) -> Value {
         "key" => object(
             json!({
                 "window_id": window_id_property(),
-                "key": { "type": "string", "description": "One character or a named key: Enter, Escape, Tab, Backspace, arrows, Home/End, Insert/Delete, PageUp/PageDown, F1-F35, Keypad0-9 and KeypadDecimal/Divide/Multiply/Subtract/Add/Enter/Equal." },
+                "key": { "type": "string", "description": "One character or a named key: Enter, Escape, Tab, Backspace, arrows, Home/End, Insert/Delete, PageUp/PageDown, F1-F35, Keypad0-9 and KeypadDecimal/Divide/Multiply/Subtract/Add/Enter/Equal. Aliases: Return, Esc, Del, Ins, Up/Down/Left/Right, Space, PageUp/PageDown (any case)." },
                 "mods": mods_property(),
                 "repeat": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Press count (default 1)." },
                 "route": route_property(),
@@ -1956,7 +2023,7 @@ fn schema_for(method: &str) -> Value {
         "mouse" => object(
             json!({
                 "window_id": window_id_property(),
-                "action": { "type": "string", "enum": ["move", "click", "double_click", "down", "up", "drag", "path", "scroll"], "description": "The gesture to perform." },
+                "action": { "type": "string", "enum": ["move", "click", "double_click", "double-click", "down", "up", "drag", "path", "scroll"], "description": "The gesture to perform (case-insensitive; double-click accepts its dashed spelling)." },
                 "button": { "type": "string", "enum": ["left", "middle", "right"], "description": "Button for click/down/up/drag/path (default left)." },
                 "cell_column": { "type": "integer", "minimum": 0, "description": "Zero-based cell column (with cell_row)." },
                 "cell_row": { "type": "integer", "minimum": 0, "description": "Zero-based cell row (with cell_column)." },
@@ -2365,6 +2432,161 @@ mod tests {
         assert!(error.contains("window_id"), "{error}");
         assert!(suggest("get_tex", &["get_text", "get_grid"]).as_deref() == Some("get_text"));
         assert!(suggest("zzzzzz", &["get_text"]).is_none());
+    }
+
+    #[test]
+    fn durations_fold_case_and_whitespace() {
+        assert_eq!(parse_duration("30S").unwrap(), 30_000);
+        assert_eq!(parse_duration(" 5M ").unwrap(), 300_000);
+        assert_eq!(parse_duration("250MS").unwrap(), 250);
+        assert_eq!(parse_duration("1H").unwrap(), 3_600_000);
+        assert_eq!(parse_timeout(&json!({"timeout": "2S"}), "timeout", 99).unwrap(), 2_000);
+    }
+
+    #[test]
+    fn key_aliases_cover_everyday_spellings() {
+        for (alias, canonical) in [
+            ("Return", "Enter"),
+            ("esc", "Escape"),
+            ("DEL", "Delete"),
+            ("Ins", "Insert"),
+            ("up", "ArrowUp"),
+            ("Down", "ArrowDown"),
+            ("LEFT", "ArrowLeft"),
+            ("right", "ArrowRight"),
+            ("Space", " "),
+            ("pageup", "PageUp"),
+            ("PageDown", "PageDown"),
+        ] {
+            let params = translate("key", &json!({"key": alias})).unwrap();
+            assert_eq!(params["key"], canonical, "{alias}");
+        }
+        assert!(translate("key", &json!({"key": "Nope"})).is_err());
+    }
+
+    #[test]
+    fn mouse_button_and_action_fold_case() {
+        let params =
+            translate("mouse", &json!({"action": "Click", "button": "Right", "x": 1, "y": 2}))
+                .unwrap();
+        assert!(params["action"]["click"].is_object());
+        assert_eq!(params["action"]["click"]["button"], "right");
+        let params =
+            translate("mouse", &json!({"action": "DOUBLE-CLICK", "x": 1, "y": 2})).unwrap();
+        assert!(params["action"]["double_click"].is_object());
+        assert!(
+            translate("mouse", &json!({"action": "click", "button": "side", "x": 1, "y": 2}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn signals_accept_an_sig_prefix() {
+        let params = translate("signal", &json!({"signal": "sigint"})).unwrap();
+        assert_eq!(params["signal"], "INT");
+        let params = translate("signal", &json!({"signal": "SIGTERM"})).unwrap();
+        assert_eq!(params["signal"], "TERM");
+        assert!(translate("signal", &json!({"signal": "SIGBOGUS"})).is_err());
+    }
+
+    #[test]
+    fn levels_accept_dashed_spellings() {
+        let params = translate("set_level", &json!({"level": "always-on-top"})).unwrap();
+        assert_eq!(params["level"], "always_on_top");
+        let params = translate("set_level", &json!({"level": "Always-On-Bottom"})).unwrap();
+        assert_eq!(params["level"], "always_on_bottom");
+    }
+
+    #[test]
+    fn vivid_spellings_fold_case() {
+        let params = translate("create_window", &json!({"vivid_target": "Desktop"})).unwrap();
+        assert_eq!(params["vivid_target"], "desktop");
+        let params = translate("vivid_trace", &json!({"category": "Connection"})).unwrap();
+        assert_eq!(params["category"], "connection");
+        assert!(translate("vivid_trace", &json!({"category": "nope"})).is_err());
+        let params = translate(
+            "wait_vivid_track",
+            &json!({
+                "session_id": 1, "context_id": 2, "surface_id": 3, "track_id": 4,
+                "channel_generation": 5, "condition": "PTS-AFTER", "value": 9,
+            }),
+        )
+        .unwrap();
+        assert_eq!(params["condition"], 4);
+    }
+
+    #[test]
+    fn drop_at_accepts_col_row_objects_and_rejects_directories() {
+        let file =
+            std::env::temp_dir().join(format!("vivido-mcp-colrow-{}.txt", std::process::id()));
+        std::fs::write(&file, "x").unwrap();
+        let params = translate(
+            "drop_file",
+            &json!({"path": file.to_string_lossy(), "at": {"col": 7, "row": 3}}),
+        )
+        .unwrap();
+        assert_eq!(params["at"], json!([7, 3]));
+        std::fs::remove_file(&file).ok();
+        let dir = std::env::temp_dir().join(format!("vivido-mcp-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let error = translate("drop_file", &json!({"path": dir.to_string_lossy()})).unwrap_err();
+        assert!(error.contains("directory"), "{error}");
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    #[test]
+    fn config_distinguishes_neither_from_both() {
+        let neither = translate("config", &json!({})).unwrap_err();
+        assert!(neither.contains("needs"), "{neither}");
+        assert!(!neither.contains("not both"), "{neither}");
+        let both = translate("config", &json!({"options": ["a"], "reset": true})).unwrap_err();
+        assert!(both.contains("not both"), "{both}");
+        assert!(translate("config", &json!({"options": ["a"]})).is_ok());
+        assert!(translate("config", &json!({"reset": true})).is_ok());
+    }
+
+    #[test]
+    fn mouse_path_duration_reports_its_own_range() {
+        let base = |duration: Value| {
+            json!({
+                "action": "path", "x": 1, "y": 2,
+                "points": [[0, 0], [9, 9]], "duration": duration,
+            })
+        };
+        for bad in [json!(0), json!(60_000), json!("1h")] {
+            let error = translate("mouse", &base(bad)).unwrap_err();
+            assert!(error.contains("1ms through 30s"), "{error}");
+        }
+        assert!(translate("mouse", &base(json!("500ms"))).is_ok());
+    }
+
+    #[test]
+    fn exec_rejects_nul_bytes() {
+        let error = translate("exec", &json!({"command": "ls\0rm"})).unwrap_err();
+        assert!(error.contains("NUL"), "{error}");
+    }
+
+    #[test]
+    fn geometry_batch_items_reject_unknown_keys() {
+        let error = translate(
+            "set_geometry_batch",
+            &json!({"items": [{"window_id": 1, "x": 0, "y": 0, "bogus": 1}]}),
+        )
+        .unwrap_err();
+        assert!(error.contains("bogus"), "{error}");
+        assert!(
+            translate("set_geometry_batch", &json!({"items": [{"window_id": 1, "x": 0, "y": 0}]}))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn suggestions_fall_back_to_prefixes() {
+        let catalog = ["get_text", "get_grid", "wait_exit", "wait_text", "ping"];
+        assert_eq!(suggest("wait", &catalog).as_deref(), Some("wait_exit"));
+        assert_eq!(suggest("pingpong", &catalog).as_deref(), Some("ping"));
+        assert_eq!(suggest("x", &catalog), None);
+        assert_eq!(suggest("zzzzzz", &catalog), None);
     }
 
     #[test]

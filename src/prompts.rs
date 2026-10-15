@@ -146,6 +146,12 @@ pub fn get(name: &str, args: &Value, context: Option<&str>) -> Result<Value, Str
         .iter()
         .find(|prompt| prompt.name == name)
         .ok_or_else(|| format!("unknown prompt {name:?}"))?;
+    let object = args.as_object().ok_or_else(|| "prompt arguments must be an object".to_owned())?;
+    for key in object.keys() {
+        if !prompt.arguments.iter().any(|(expected, _, _)| *expected == key) {
+            return Err(format!("unknown argument `{key}` for prompt `{name}`"));
+        }
+    }
     for (expected, _, required) in prompt.arguments {
         if *required && args.get(expected).and_then(Value::as_str).is_none() {
             return Err(format!("prompt `{name}` needs argument `{expected}`"));
@@ -187,5 +193,13 @@ mod tests {
         let text = fetched["messages"][0]["content"]["text"].as_str().unwrap();
         assert!(text.contains("frozen screen"), "{text}");
         assert!(text.contains("observe-only"), "{text}");
+    }
+
+    #[test]
+    fn prompt_arguments_must_be_known_and_an_object() {
+        let error = get("vivido_workflow", &json!({"goal": "x", "bogus": 1}), None).unwrap_err();
+        assert!(error.contains("bogus"), "{error}");
+        let error = get("vivido_workflow", &json!([1, 2]), None).unwrap_err();
+        assert!(error.contains("must be an object"), "{error}");
     }
 }

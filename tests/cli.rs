@@ -47,6 +47,168 @@ fn help_shows_examples() {
 }
 
 #[test]
+fn help_documents_every_env_var() {
+    let output = Command::new(exe()).arg("--help").output().expect("spawn");
+    assert!(output.status.success());
+    let help = String::from_utf8_lossy(&output.stdout);
+    for var in [
+        "VIVIDO_MCP_ALLOW",
+        "VIVIDO_MCP_MAX_IMAGE_DIM",
+        "VIVIDO_BIN",
+        "VIVIDO_SESSION",
+        "VIVIDA_TARGET",
+        "VIVIDO_SOCKET",
+    ] {
+        assert!(help.contains(var), "{help}");
+    }
+}
+
+#[test]
+fn empty_socket_and_vivido_bin_fail_fast() {
+    // Clap rejects the empty socket before main's own guard ever sees it;
+    // either way the operator gets a usage error naming the flag.
+    let output = Command::new(exe()).args(["--socket", ""]).output().expect("spawn");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--socket"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new(exe()).args(["--vivido-bin", "  "]).output().expect("spawn");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--vivido-bin must not be empty"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn max_image_dim_env_is_honored() {
+    let mock = MockServer::start();
+    let path = mock.write_png(200, 100);
+    let result = mock.screenshot_result(&path, 3, (10, 10), (0, 0));
+    mock.on("screenshot", std::sync::Arc::new(move |_| Ok(result.clone())));
+    let mut child = Command::new(exe())
+        .arg("--socket")
+        .arg(&mock.socket)
+        .env("VIVIDO_MCP_MAX_IMAGE_DIM", "512")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let mut reader = BufReader::new(stdout);
+    let call = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "screenshot", "arguments": {}},
+    });
+    writeln!(stdin, "{call}").expect("write");
+    stdin.flush().expect("flush");
+    let mut reply = String::new();
+    reader.read_line(&mut reply).expect("read");
+    let reply: serde_json::Value = serde_json::from_str(&reply).expect("parse");
+    assert_eq!(reply["result"]["isError"], false, "{reply}");
+    assert_eq!(reply["result"]["structuredContent"]["max_dim"], 512, "{reply}");
+    drop(stdin);
+    assert!(child.wait().expect("wait").success());
+}
+
+#[test]
+fn stale_inherited_socket_logs_a_note() {
+    let mut child = Command::new(exe())
+        .env("VIVIDO_SOCKET", "/nonexistent/vivido-mcp-stale.sock")
+        .env_remove("VIVIDO_SESSION")
+        .env_remove("VIVIDA_TARGET")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}});
+    writeln!(stdin, "{init}").expect("write");
+    stdin.flush().expect("flush");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read");
+    drop(stdin);
+    assert!(child.wait().expect("wait").success());
+    let mut logged = String::new();
+    BufReader::new(stderr).read_to_string(&mut logged).expect("read stderr");
+    assert!(logged.contains("VIVIDO_SOCKET"), "{logged}");
+    assert!(logged.contains("stale"), "{logged}");
+}
+
+#[test]
+fn protocol_version_skew_logs_a_warning() {
+    let mock = MockServer::start();
+    let mut child = Command::new(exe())
+        .arg("--socket")
+        .arg(&mock.socket)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    let init = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"clientInfo": {"name": "old", "version": "1"}, "protocolVersion": "1999-01-01"},
+    });
+    writeln!(stdin, "{init}").expect("write");
+    stdin.flush().expect("flush");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read");
+    drop(stdin);
+    assert!(child.wait().expect("wait").success());
+    let mut logged = String::new();
+    BufReader::new(stderr).read_to_string(&mut logged).expect("read stderr");
+    assert!(logged.contains("1999-01-01"), "{logged}");
+    assert!(logged.contains("upgrade the older side"), "{logged}");
+}
+
+#[test]
+fn oversize_threshold_env_tunes_the_note() {
+    let mock = MockServer::start();
+    mock.on("get_text", std::sync::Arc::new(|_| Ok(json!({"text": "0123456789abcdef"}))));
+    let mut child = Command::new(exe())
+        .arg("--socket")
+        .arg(&mock.socket)
+        .env("VIVIDO_MCP_OVERSIZE_BYTES", "10")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut stdin = child.stdin.take().expect("stdin");
+    let stdout = child.stdout.take().expect("stdout");
+    let stderr = child.stderr.take().expect("stderr");
+    let mut reader = BufReader::new(stdout);
+    let call = json!({
+        "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": {"name": "get_text", "arguments": {}},
+    });
+    writeln!(stdin, "{call}").expect("write");
+    stdin.flush().expect("flush");
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read");
+    drop(stdin);
+    assert!(child.wait().expect("wait").success());
+    let mut logged = String::new();
+    BufReader::new(stderr).read_to_string(&mut logged).expect("read stderr");
+    assert!(logged.contains("get_text"), "{logged}");
+    assert!(logged.contains("bytes"), "{logged}");
+}
+
+#[test]
 fn allow_env_unlocks_tiers() {
     let mock = MockServer::start();
     let mut child = Command::new(exe())
